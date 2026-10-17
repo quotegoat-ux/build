@@ -1,14 +1,15 @@
 import { Hono, type Context } from "hono";
 import styles from "./styles.css";
 import { can, currentSession, endSession, requireTenant, safeNext, sameOriginOnly, startSession, type AppEnv, type PublicEnv } from "./auth";
-import { PLANS, TRIAL_DAYS, billingConfigured, createCheckoutUrl, createPortalUrl, findPlan, handleStripeEvent, verifyStripeSignature } from "./billing";
+import { TRIAL_DAYS, billingConfigured, createCheckoutUrl, createPortalUrl, handleStripeEvent, verifyStripeSignature } from "./billing";
 import { DUMMY_PASSWORD_HASH, hashPassword, randomId, sha256Hex, verifyPassword } from "./crypto";
 import * as db from "./db";
 import { sendEmail, linkEmail } from "./email";
 import { APP_NAME, isLocalDev, type Env } from "./env";
-import { BillingPage, DashboardPage, SettingsPage, TeamPage } from "./views/app";
+import { drawbook, shared } from "./routes";
+import { BillingPage, SettingsPage, TeamPage } from "./views/app";
 import { noticeFrom, render } from "./views/layout";
-import { AcceptInvitePage, ForgotPage, Landing, LoginPage, MessagePage, ResetPage, SignupPage } from "./views/public";
+import { AcceptInvitePage, ForgotPage, Landing, LoginPage, MessagePage, ResetPage, SignupPage, notFound } from "./views/public";
 
 const DAY_MS = 86_400_000;
 const INVITE_TTL_MS = 7 * DAY_MS;
@@ -34,10 +35,6 @@ function slugify(s: string): string {
 /** In local dev without an email provider, the link is shown on screen so flows work end to end. */
 function devLinkFor(env: Env, sent: { status: "sent" | "logged" }, url: string): string | undefined {
   return sent.status === "logged" && isLocalDev(env) ? url : undefined;
-}
-
-function notFound(c: Context) {
-  return render(c, <MessagePage title="Page not found" status={404} message="We couldn't find what you were looking for." />, 404);
 }
 
 function forbidden(c: Context) {
@@ -203,10 +200,7 @@ const authed = new Hono<AppEnv>();
 
 authed.use(requireTenant);
 
-authed.get("/", async (c) => {
-  const members = await db.listMembers(c.var.tenant, c.env.DB);
-  return render(c, <DashboardPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} memberCount={members.length} />);
-});
+authed.route("/", drawbook);
 
 async function renderTeam(c: Context<AppEnv>, extra: { notice?: string; error?: string; devLink?: string } = {}, status: 200 | 409 | 422 = 200) {
   const t = c.var.tenant;
@@ -263,29 +257,16 @@ authed.post("/team/invites/:id/revoke", async (c) => {
 });
 
 function renderBilling(c: Context<AppEnv>, extra: { notice?: string; error?: string } = {}, status: 200 | 502 = 200) {
-  const availablePlans = PLANS.filter((p) => c.env[p.priceEnv]).map((p) => p.id);
-  return render(
-    c,
-    <BillingPage
-      org={c.var.org}
-      user={c.var.user}
-      configured={billingConfigured(c.env)}
-      canManage={can(c.var.tenant, "manageBilling")}
-      availablePlans={availablePlans}
-      {...extra}
-    />,
-    status,
-  );
+  return render(c, <BillingPage org={c.var.org} user={c.var.user} configured={billingConfigured(c.env)} canManage={can(c.var.tenant, "manageBilling")} {...extra} />, status);
 }
 
 authed.get("/billing", (c) => renderBilling(c, { notice: noticeFrom(c.req.query("notice")) }));
 
 authed.post("/billing/checkout", async (c) => {
   if (!can(c.var.tenant, "manageBilling")) return forbidden(c);
-  const plan = findPlan(field(await c.req.parseBody(), "plan"));
-  if (!billingConfigured(c.env) || !plan || !c.env[plan.priceEnv]) return renderBilling(c, { error: "That plan is not available right now." }, 502);
+  if (!billingConfigured(c.env)) return renderBilling(c, { error: "Billing is not available right now." }, 502);
   try {
-    return c.redirect(await createCheckoutUrl(c.env, c.var.org, plan, c.var.user.email), 303);
+    return c.redirect(await createCheckoutUrl(c.env, c.var.org, c.var.user.email), 303);
   } catch (e) {
     console.error(e);
     return renderBilling(c, { error: "We couldn't reach the payment provider. Please try again." }, 502);
@@ -328,6 +309,8 @@ authed.post("/orgs/switch", async (c) => {
 });
 
 app.route("/app", authed);
+
+app.route("/s", shared);
 
 app.notFound(notFound);
 

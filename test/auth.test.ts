@@ -32,7 +32,7 @@ describe("signup, login, sessions", () => {
     const app = await get("/app", sessionCookie(loginRes));
     expect(app.status).toBe(200);
     const html = await app.text();
-    expect(html).toContain("Welcome, Ada");
+    expect(html).toContain("Bill your first pay application in minutes");
     expect(html).toContain("Ada Framing LLC");
   });
 

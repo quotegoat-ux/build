@@ -54,7 +54,7 @@ export async function currentSession<E extends PublicEnv>(c: Context<E>) {
   return session && { ...session, sessionId };
 }
 
-const ALWAYS_REACHABLE = ["/app/billing", "/app/team", "/app/settings", "/app/orgs"];
+const ALWAYS_REACHABLE = ["/app/billing", "/app/team", "/app/settings", "/app/orgs", "/app/export", "/app/export.json"];
 
 export const requireTenant: MiddlewareHandler<AppEnv> = async (c, next) => {
   const session = await currentSession(c);

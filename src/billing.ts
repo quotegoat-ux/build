@@ -4,33 +4,20 @@ import type { Env } from "./env";
 
 export const TRIAL_DAYS = 14;
 
-export const PLANS = [
-  {
-    id: "starter",
-    name: "Starter",
-    monthlyUsd: 49,
-    priceEnv: "STRIPE_PRICE_STARTER",
-    blurb: "For small crews getting organized.",
-    features: ["Up to 5 team members", "Mobile-friendly on the job site", "Email support"],
-  },
-  {
-    id: "pro",
-    name: "Pro",
-    monthlyUsd: 149,
-    priceEnv: "STRIPE_PRICE_PRO",
-    blurb: "For growing contractors running several jobs at once.",
-    features: ["Unlimited team members", "Everything in Starter", "Priority support"],
-  },
-] as const satisfies readonly { id: string; priceEnv: Extract<keyof Env, `STRIPE_PRICE_${string}`>; [k: string]: unknown }[];
-
-export type Plan = (typeof PLANS)[number];
-
-export function findPlan(id: string): Plan | undefined {
-  return PLANS.find((p) => p.id === id);
-}
+export const PLAN = {
+  name: "Drawbook",
+  monthlyUsd: 89,
+  features: [
+    "Unlimited users and projects",
+    "Pay applications in G702/G703 format, PDF and CSV",
+    "Free read-only links for your GCs",
+    "One-click export of every record",
+    "No contract. Cancel in the app.",
+  ],
+} as const;
 
 export function billingConfigured(env: Env): boolean {
-  return Boolean(env.STRIPE_SECRET_KEY);
+  return Boolean(env.STRIPE_SECRET_KEY && env.STRIPE_PRICE_ID);
 }
 
 export function hasAccess(org: Pick<Org, "subscription_status" | "trial_ends_at">, now: number): boolean {
@@ -48,9 +35,9 @@ async function stripe<T>(env: Env, path: string, params: Record<string, string>)
   return body;
 }
 
-export async function createCheckoutUrl(env: Env, org: Org, plan: Plan, customerEmail: string): Promise<string> {
-  const price = env[plan.priceEnv];
-  if (!price) throw new Error(`${plan.priceEnv} is not set`);
+export async function createCheckoutUrl(env: Env, org: Org, customerEmail: string): Promise<string> {
+  const price = env.STRIPE_PRICE_ID;
+  if (!price) throw new Error("STRIPE_PRICE_ID is not set");
   const params: Record<string, string> = {
     mode: "subscription",
     "line_items[0][price]": price,

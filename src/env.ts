@@ -1,4 +1,4 @@
-export const APP_NAME = "Groundwork";
+export const APP_NAME = "Drawbook";
 
 export interface Env {
   DB: D1Database;
@@ -7,8 +7,7 @@ export interface Env {
   RESEND_API_KEY?: string;
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
-  STRIPE_PRICE_STARTER?: string;
-  STRIPE_PRICE_PRO?: string;
+  STRIPE_PRICE_ID?: string;
 }
 
 export function isLocalDev(env: Env): boolean {

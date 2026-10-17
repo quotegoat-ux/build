@@ -14,6 +14,18 @@ const NOTICES = {
   invite_revoked: "Invite revoked.",
   member_removed: "Member removed.",
   saved: "Saved.",
+  project_created: "Project created. Add your schedule of values next.",
+  lines_added: "Schedule of values updated.",
+  line_deleted: "Line deleted.",
+  co_added: "Change order added.",
+  co_approved: "Change order approved and added to the schedule of values.",
+  co_rejected: "Change order rejected.",
+  draft_saved: "Draft saved.",
+  draft_deleted: "Draft deleted.",
+  marked_paid: "Payment recorded.",
+  reopened: "Reopened as a draft. The old share link no longer works.",
+  share_revoked: "Share link turned off.",
+  sample_loaded: "Sample project loaded. Open the draft pay application to see how billing works.",
   password_reset: "Password updated. Log in with your new password.",
   checkout_done: "Thanks! Your subscription will show here as soon as Stripe confirms it.",
   switched: "Switched organization.",
@@ -26,15 +38,16 @@ export function noticeFrom(key: string | undefined): string | undefined {
 }
 
 // Prevents double submits on slow job-site connections and asks before destructive actions.
-const ENHANCE = `document.addEventListener("submit",function(e){var f=e.target;var m=f.getAttribute("data-confirm");if(m&&!confirm(m)){e.preventDefault();return}f.querySelectorAll("button").forEach(function(b){setTimeout(function(){b.disabled=true},0)})});`;
+const ENHANCE = `document.addEventListener("submit",function(e){var f=e.target;var s=e.submitter;var m=(s&&s.getAttribute("data-confirm"))||f.getAttribute("data-confirm");if(m&&!confirm(m)){e.preventDefault();return}f.querySelectorAll("button").forEach(function(b){setTimeout(function(){b.disabled=true},0)})});`;
 
-export function Document({ title, children }: PropsWithChildren<{ title?: string }>) {
+export function Document({ title, noindex, children }: PropsWithChildren<{ title?: string; noindex?: boolean }>) {
   return (
     <html lang="en">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="theme-color" content="#1c1917" />
+        {noindex && <meta name="robots" content="noindex, nofollow" />}
         <title>{title ? `${title} | ${APP_NAME}` : APP_NAME}</title>
         <link rel="stylesheet" href="/styles.css" />
       </head>
@@ -46,12 +59,21 @@ export function Document({ title, children }: PropsWithChildren<{ title?: string
   );
 }
 
+export function Mark() {
+  return (
+    <svg class="brand-mark" width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+      <rect x="3" y="2" width="18" height="22" rx="3" fill="currentColor" />
+      <path d="M8 9h9M8 13h9M8 17h5" stroke="#1c1917" stroke-width="2" stroke-linecap="round" />
+      <circle cx="20" cy="19" r="5" fill="#16a34a" stroke="#1c1917" stroke-width="2" />
+      <path d="M17.8 19.2l1.5 1.5 2.9-3" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round" />
+    </svg>
+  );
+}
+
 export function Brand() {
   return (
     <a href="/" class="brand">
-      <span class="brand-mark" aria-hidden="true">
-        ▲
-      </span>
+      <Mark />
       {APP_NAME}
     </a>
   );
@@ -78,6 +100,7 @@ export function PublicShell({ title, children }: PropsWithChildren<{ title?: str
 
 const NAV = [
   { key: "dashboard", href: "/app", label: "Dashboard" },
+  { key: "projects", href: "/app/projects", label: "Projects" },
   { key: "team", href: "/app/team", label: "Team" },
   { key: "billing", href: "/app/billing", label: "Billing" },
   { key: "settings", href: "/app/settings", label: "Settings" },
@@ -100,9 +123,7 @@ export function AppShell({
       <header class="topbar">
         <div class="wrap topbar-inner">
           <a href="/app" class="brand">
-            <span class="brand-mark" aria-hidden="true">
-              ▲
-            </span>
+            <Mark />
             <span class="org-name">{org.name}</span>
           </a>
           <form method="post" action="/logout">
@@ -122,7 +143,7 @@ export function AppShell({
       {org.subscription_status !== "active" && hasAccess(org, now) && (
         <div class="banner">
           <div class="wrap">
-            Free trial: {trialDaysLeft} {trialDaysLeft === 1 ? "day" : "days"} left. <a href="/app/billing">Choose a plan</a>
+            Free trial: {trialDaysLeft} {trialDaysLeft === 1 ? "day" : "days"} left. <a href="/app/billing">Subscribe</a>
           </div>
         </div>
       )}

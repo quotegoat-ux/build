@@ -1,31 +1,9 @@
 import type { Invite, Member, Org, Role, User } from "../db";
-import { PLANS, hasAccess, type Plan } from "../billing";
+import { PLAN, hasAccess } from "../billing";
 import { APP_NAME } from "../env";
 import { AppShell, DevLink, ErrorText, Field } from "./layout";
 
 type ShellProps = { org: Org; user: User; notice?: string };
-
-export function DashboardPage({ org, user, notice, memberCount }: ShellProps & { memberCount: number }) {
-  const firstName = user.name.split(" ")[0];
-  return (
-    <AppShell title="Dashboard" active="dashboard" org={org} user={user} notice={notice}>
-      <h1>Welcome, {firstName}</h1>
-      <p class="lede">This is the home base for {org.name} in {APP_NAME}.</p>
-      <div class="grid">
-        <a href="/app/team" class="card card-link">
-          <h3>Team</h3>
-          <p class="stat">{memberCount}</p>
-          <p class="muted">{memberCount === 1 ? "member" : "members"}. Invite your office and field staff.</p>
-        </a>
-        <a href="/app/billing" class="card card-link">
-          <h3>Plan</h3>
-          <p class="stat">{statusLabel(org)}</p>
-          <p class="muted">Manage your subscription.</p>
-        </a>
-      </div>
-    </AppShell>
-  );
-}
 
 function statusLabel(org: Org): string {
   switch (org.subscription_status) {
@@ -135,9 +113,8 @@ export function BillingPage({
   notice,
   configured,
   canManage,
-  availablePlans,
   error,
-}: ShellProps & { configured: boolean; canManage: boolean; availablePlans: Plan["id"][]; error?: string }) {
+}: ShellProps & { configured: boolean; canManage: boolean; error?: string }) {
   const now = Date.now();
   const locked = !hasAccess(org, now);
   return (
@@ -145,7 +122,7 @@ export function BillingPage({
       <h1>Billing</h1>
       {locked && (
         <p class="error" role="alert">
-          Your free trial has ended. Choose a plan to keep using {APP_NAME}.
+          Your free trial has ended. Subscribe to keep using {APP_NAME}. You can still export your data from Settings.
         </p>
       )}
       <ErrorText error={error} />
@@ -170,30 +147,23 @@ export function BillingPage({
         <p class="muted">Only owners and admins can change the plan.</p>
       ) : null}
 
-      <div class="plans">
-        {PLANS.map((plan) => {
-          const available = configured && canManage && availablePlans.includes(plan.id);
-          return (
-            <div class="plan">
-              <h3>{plan.name}</h3>
-              <p class="price">
-                ${plan.monthlyUsd}
-                <span>/month</span>
-              </p>
-              <ul>
-                {plan.features.map((f) => (
-                  <li>{f}</li>
-                ))}
-              </ul>
-              <form method="post" action="/app/billing/checkout">
-                <input type="hidden" name="plan" value={plan.id} />
-                <button type="submit" class="btn btn-block" disabled={!available || org.subscription_status === "active"}>
-                  {org.subscription_status === "active" ? "Change in billing portal" : `Choose ${plan.name}`}
-                </button>
-              </form>
-            </div>
-          );
-        })}
+      <div class="plan plan-single">
+        <h3>{PLAN.name}</h3>
+        <p class="price">
+          ${PLAN.monthlyUsd}
+          <span>/month per company</span>
+        </p>
+        <ul>
+          {PLAN.features.map((f) => (
+            <li>{f}</li>
+          ))}
+        </ul>
+        <form method="post" action="/app/billing/checkout">
+          <button type="submit" class="btn btn-block" disabled={!configured || !canManage || org.subscription_status === "active"}>
+            {org.subscription_status === "active" ? "You're subscribed" : `Subscribe for $${PLAN.monthlyUsd}/month`}
+          </button>
+        </form>
+        <p class="muted small">Cancel any time from this page. Your data stays exportable after you cancel.</p>
       </div>
     </AppShell>
   );
@@ -249,6 +219,20 @@ export function SettingsPage({
           </ul>
         </section>
       )}
+      <section class="card">
+        <h2>Export everything</h2>
+        <p class="muted">Your data is yours. Download every project, schedule line, change order, and pay application at any time, including after you cancel.</p>
+        <div class="row-actions wrap-actions">
+          <a class="btn btn-small" href="/app/export.json">
+            Download all (JSON)
+          </a>
+          {["projects", "sov_lines", "change_orders", "pay_apps", "pay_app_lines"].map((t) => (
+            <a class="btn btn-small btn-ghost" href={`/app/export/${t}.csv`}>
+              {t.replaceAll("_", " ")} CSV
+            </a>
+          ))}
+        </div>
+      </section>
       <section class="card">
         <h2>Your account</h2>
         <p>
