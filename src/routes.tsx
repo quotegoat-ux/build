@@ -2,14 +2,17 @@ import { Hono, type Context } from "hono";
 import type { AppEnv, PublicEnv } from "./auth";
 import { randomId, sha256Hex } from "./crypto";
 import { toCsv } from "./csv";
+import { projectDeadlines, upcomingDeadlines } from "./deadlines";
 import { dashboard, payAppView, summarizeProject, utcDay, type PayAppView } from "./ledger";
 import { centsToDecimal, parseMoney, parsePercentBp } from "./money";
 import { validate } from "./payapp";
-import { payAppPdf } from "./pdf";
+import { payAppPdf, waiverPdf } from "./pdf";
 import * as data from "./projectsDb";
 import { seedSampleProject } from "./sample";
 import { parseSovPaste } from "./sovPaste";
+import { WAIVER_KIND_LABEL, waiverView, type WaiverView } from "./waivers";
 import { noticeFrom, render } from "./views/layout";
+import { WaiverPage } from "./views/liens";
 import { DashboardPage, PayAppPage, ProjectFormPage, ProjectPage, ProjectsPage, SharedPayAppPage, US_STATES, issueText, projectFormValues } from "./views/projects";
 import { notFound } from "./views/public";
 
@@ -102,8 +105,13 @@ function pdfName(v: PayAppView): string {
 export const drawbook = new Hono<AppEnv>();
 
 drawbook.get("/", async (c) => {
-  const summaries = (await data.loadOrgLedgers(c.var.tenant, c.env.DB)).map(summarizeProject);
-  return render(c, <DashboardPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} summaries={summaries} dash={dashboard(summaries, Date.now())} />);
+  const ledgers = await data.loadOrgLedgers(c.var.tenant, c.env.DB);
+  const summaries = ledgers.map(summarizeProject);
+  const now = Date.now();
+  return render(
+    c,
+    <DashboardPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} summaries={summaries} dash={dashboard(summaries, now)} upcoming={upcomingDeadlines(ledgers, utcDay(now))} />,
+  );
 });
 
 drawbook.post("/sample", async (c) => {
@@ -127,11 +135,21 @@ drawbook.post("/projects", async (c) => {
 });
 
 async function renderProject(c: Context<AppEnv>, projectId: string, extra: { error?: string; paste?: string } = {}, status: 200 | 409 | 422 = 200) {
-  const ledger = await data.loadProjectLedger(c.var.tenant, c.env.DB, projectId);
+  const [ledger, waivers] = await Promise.all([data.loadProjectLedger(c.var.tenant, c.env.DB, projectId), data.listProjectWaivers(c.var.tenant, c.env.DB, projectId)]);
   if (!ledger) return notFound(c);
   return render(
     c,
-    <ProjectPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} ledger={ledger} summary={summarizeProject(ledger)} today={utcDay(Date.now())} {...extra} />,
+    <ProjectPage
+      org={c.var.org}
+      user={c.var.user}
+      notice={noticeFrom(c.req.query("notice"))}
+      ledger={ledger}
+      summary={summarizeProject(ledger)}
+      today={utcDay(Date.now())}
+      waivers={waivers}
+      deadlines={projectDeadlines(ledger)}
+      {...extra}
+    />,
     status,
   );
 }
@@ -248,7 +266,8 @@ async function loadView(c: Context<AppEnv>, payAppId: string): Promise<PayAppVie
 async function renderPayApp(c: Context<AppEnv>, payAppId: string, extra: { error?: string; shareUrl?: string; notice?: string } = {}, status: 200 | 409 | 422 = 200) {
   const view = await loadView(c, payAppId);
   if (!view) return notFound(c);
-  return render(c, <PayAppPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} view={view} today={utcDay(Date.now())} {...extra} />, status);
+  const waivers = (await data.listProjectWaivers(c.var.tenant, c.env.DB, view.project.id)).filter((w) => w.pay_app_id === payAppId);
+  return render(c, <PayAppPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} view={view} today={utcDay(Date.now())} waivers={waivers} {...extra} />, status);
 }
 
 drawbook.get("/pay-apps/:id", (c) => renderPayApp(c, c.req.param("id")));
@@ -277,14 +296,15 @@ drawbook.post("/pay-apps/:id", async (c) => {
   if (problems.length > 0) return renderPayApp(c, id, { error: problems.join(" ") }, 422);
   const t = c.var.tenant;
   const now = Date.now();
-  await data.saveDraft(t, c.env.DB, id, { periodFrom, periodTo, retainageWorkBp: work!, retainageStoredBp: stored!, lines }, now);
+  await data.saveDraft(t, c.env.DB, id, { periodFrom, periodTo, retainageWorkBp: work!, retainageStoredBp: stored!, isFinal: field(form, "is_final") === "1", lines }, now);
   if (field(form, "intent") !== "submit") return c.redirect(`/app/pay-apps/${id}?notice=draft_saved`);
 
   const saved = (await loadView(c, id))!;
   const issues = validate(saved.input);
   if (issues.length > 0) return renderPayApp(c, id, { error: `Not submitted. ${issues.map(issueText).join(" ")}` }, 422);
   const token = randomId(32);
-  if (!(await data.submitPayApp(t, c.env.DB, id, await sha256Hex(token), now))) return renderPayApp(c, id, { error: "This application changed while you were editing. Review it and try again." }, 409);
+  const waiver = { id: randomId(), amountCents: saved.result.g702.currentPaymentDue };
+  if (!(await data.submitPayApp(t, c.env.DB, id, await sha256Hex(token), waiver, now))) return renderPayApp(c, id, { error: "This application changed while you were editing. Review it and try again." }, 409);
   return renderPayApp(c, id, { notice: "Submitted. The application is locked and ready to send.", shareUrl: shareUrlFor(c, token) });
 });
 
@@ -297,7 +317,7 @@ drawbook.post("/pay-apps/:id/paid", async (c) => {
   if (!view) return notFound(c);
   if (amount === null || amount < 0 || !isDate(paidOn)) return renderPayApp(c, id, { error: "Enter the amount received and the date it arrived." }, 422);
   if (view.payApp.submitted_at !== null && paidOn < utcDay(view.payApp.submitted_at)) return renderPayApp(c, id, { error: "The payment date cannot be before the application was submitted." }, 422);
-  if (!(await data.markPayAppPaid(c.var.tenant, c.env.DB, id, { paidCents: amount, paidAt: Date.parse(paidOn) }, Date.now()))) {
+  if (!(await data.markPayAppPaid(c.var.tenant, c.env.DB, id, { paidCents: amount, paidAt: Date.parse(paidOn), waiverId: randomId() }, Date.now()))) {
     return renderPayApp(c, id, { error: "Only a submitted, unpaid application can be marked paid." }, 409);
   }
   return c.redirect(`/app/pay-apps/${id}?notice=marked_paid`);
@@ -342,6 +362,66 @@ drawbook.get("/pay-apps/:id/csv", async (c) => {
   return c.body(continuationCsv(view), 200, { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": attachment(`${pdfName(view)}-continuation.csv`) });
 });
 
+async function loadWaiverView(c: Context<AppEnv>, waiverId: string, signed?: Pick<data.WaiverRow, "signer_name" | "signer_title" | "signed_at">): Promise<WaiverView | null> {
+  const t = c.var.tenant;
+  const waiver = await data.loadWaiver(t, c.env.DB, waiverId);
+  if (!waiver) return null;
+  const [ledger, all] = await Promise.all([data.loadProjectLedger(t, c.env.DB, waiver.project_id), data.listProjectWaivers(t, c.env.DB, waiver.project_id)]);
+  return ledger && waiverView(c.var.org.name, ledger, { ...waiver, ...signed }, all);
+}
+
+async function renderWaiver(c: Context<AppEnv>, waiverId: string, extra: { error?: string } = {}, status: 200 | 409 | 422 = 200) {
+  const view = await loadWaiverView(c, waiverId);
+  if (!view) return notFound(c);
+  return render(c, <WaiverPage org={c.var.org} user={c.var.user} notice={noticeFrom(c.req.query("notice"))} view={view} today={utcDay(Date.now())} {...extra} />, status);
+}
+
+function waiverPdfName(v: WaiverView): string {
+  return `${v.project.name}-${WAIVER_KIND_LABEL[v.waiver.kind]}-waiver${v.payAppNumber !== null ? `-app-${v.payAppNumber}` : ""}.pdf`;
+}
+
+drawbook.get("/waivers/:id", (c) => renderWaiver(c, c.req.param("id")));
+
+drawbook.post("/waivers/:id", async (c) => {
+  const id = c.req.param("id");
+  const view = await loadWaiverView(c, id);
+  if (!view) return notFound(c);
+  const form = await c.req.parseBody();
+  const fields = Object.fromEntries(view.fields.map((f) => [f.key, field(form, `field_${f.key}`).slice(0, 500)]));
+  if (!(await data.saveWaiverFields(c.var.tenant, c.env.DB, id, { exceptionsText: field(form, "exceptions").slice(0, 2000), fields }, Date.now()))) {
+    return renderWaiver(c, id, { error: "Only a draft waiver can be edited." }, 409);
+  }
+  return c.redirect(`/app/waivers/${id}?notice=waiver_saved`);
+});
+
+drawbook.post("/waivers/:id/sent", async (c) => {
+  const id = c.req.param("id");
+  if (!(await data.loadWaiver(c.var.tenant, c.env.DB, id))) return notFound(c);
+  if (!(await data.markWaiverSent(c.var.tenant, c.env.DB, id, Date.now()))) return renderWaiver(c, id, { error: "Only a draft waiver can be marked sent." }, 409);
+  return c.redirect(`/app/waivers/${id}?notice=waiver_sent`);
+});
+
+drawbook.post("/waivers/:id/signed", async (c) => {
+  const id = c.req.param("id");
+  const form = await c.req.parseBody();
+  const signerName = field(form, "signer_name").slice(0, 120);
+  const signerTitle = field(form, "signer_title").slice(0, 120);
+  const signedOn = field(form, "signed_on");
+  if (!(await data.loadWaiver(c.var.tenant, c.env.DB, id))) return notFound(c);
+  if (!signerName || !isDate(signedOn)) return renderWaiver(c, id, { error: "Enter the signer's name and the date signed." }, 422);
+  const signed = { signer_name: signerName, signer_title: signerTitle, signed_at: Date.parse(signedOn) };
+  const view = (await loadWaiverView(c, id, signed))!;
+  const ok = await data.markWaiverSigned(c.var.tenant, c.env.DB, id, { signerName, signerTitle, signedAt: signed.signed_at, document: JSON.stringify(view.document) }, Date.now());
+  if (!ok) return renderWaiver(c, id, { error: "This waiver is already signed." }, 409);
+  return c.redirect(`/app/waivers/${id}?notice=waiver_signed`);
+});
+
+drawbook.get("/waivers/:id/pdf", async (c) => {
+  const view = await loadWaiverView(c, c.req.param("id"));
+  if (!view) return notFound(c);
+  return c.body(await waiverPdf(c.var.org.name, view), 200, { "Content-Type": "application/pdf", "Content-Disposition": attachment(waiverPdfName(view)) });
+});
+
 drawbook.get("/export.json", async (c) => {
   const t = c.var.tenant;
   const tables = Object.keys(data.EXPORT_TABLES) as data.ExportTable[];
@@ -368,15 +448,25 @@ shared.use(async (c, next) => {
   c.header("Cache-Control", "private, no-store");
 });
 
+/** The GC sees a pay app's waivers once they are sent or signed; drafts stay private. */
 async function loadShared(c: Context<PublicEnv>) {
   const found = await data.loadSharedPayApp(c.env.DB, await sha256Hex(c.req.param("token") ?? ""));
-  return found && { orgName: found.orgName, view: payAppView(found.ledger, found.payApp) };
+  if (!found) return null;
+  const waivers = found.waivers.filter((w) => w.pay_app_id === found.payApp.id && w.status !== "draft").map((w) => waiverView(found.orgName, found.ledger, w, found.waivers));
+  return { orgName: found.orgName, view: payAppView(found.ledger, found.payApp), waivers };
 }
 
 shared.get("/:token", async (c) => {
   const found = await loadShared(c);
   if (!found) return notFound(c);
-  return render(c, <SharedPayAppPage orgName={found.orgName} view={found.view} token={c.req.param("token")} />);
+  return render(c, <SharedPayAppPage orgName={found.orgName} view={found.view} token={c.req.param("token")} waivers={found.waivers} />);
+});
+
+shared.get("/:token/waivers/:id/pdf", async (c) => {
+  const found = await loadShared(c);
+  const view = found?.waivers.find((w) => w.waiver.id === c.req.param("id"));
+  if (!found || !view) return notFound(c);
+  return c.body(await waiverPdf(found.orgName, view), 200, { "Content-Type": "application/pdf", "Content-Disposition": attachment(waiverPdfName(view)) });
 });
 
 shared.get("/:token/pdf", async (c) => {

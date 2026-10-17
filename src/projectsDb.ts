@@ -1,5 +1,6 @@
 import type { Tenant } from "./db";
 import type { ChangeOrderStatus } from "./payapp";
+import type { WaiverKind, WaiverStatus } from "./waivers";
 
 export type ProjectStatus = "active" | "closed";
 export type PayAppStatus = "draft" | "submitted" | "paid";
@@ -59,6 +60,7 @@ export interface PayAppRow {
   submitted_at: number | null;
   paid_at: number | null;
   paid_cents: number | null;
+  is_final: 0 | 1;
   shared: 0 | 1;
   created_at: number;
 }
@@ -68,6 +70,24 @@ export interface PayAppLineRow {
   sov_line_id: string;
   work_this_period_cents: number;
   stored_to_date_cents: number;
+}
+
+export interface WaiverRow {
+  id: string;
+  project_id: string;
+  pay_app_id: string | null;
+  kind: WaiverKind;
+  state: string;
+  amount_cents: number;
+  through_date: string;
+  exceptions_text: string;
+  fields_json: string;
+  status: WaiverStatus;
+  signer_name: string | null;
+  signer_title: string | null;
+  signed_at: number | null;
+  signed_document: string | null;
+  created_at: number;
 }
 
 /** Everything one project's pay application math needs, already scoped to one org. */
@@ -85,7 +105,9 @@ const SOV_COLUMNS = `s.id, s.project_id, s.position, s.item_no, s.description, s
   EXISTS (SELECT 1 FROM pay_app_lines pl JOIN pay_apps p ON p.id = pl.pay_app_id WHERE pl.sov_line_id = s.id AND p.status != 'draft') AS locked`;
 const CO_COLUMNS = "id, project_id, number, title, amount_cents, status, approved_at, created_at";
 const PAY_APP_COLUMNS =
-  "id, project_id, number, period_from, period_to, status, retainage_work_bp, retainage_stored_bp, submitted_at, paid_at, paid_cents, share_token_hash IS NOT NULL AS shared, created_at";
+  "id, project_id, number, period_from, period_to, status, retainage_work_bp, retainage_stored_bp, submitted_at, paid_at, paid_cents, is_final, share_token_hash IS NOT NULL AS shared, created_at";
+const WAIVER_COLUMNS =
+  "id, project_id, pay_app_id, kind, state, amount_cents, through_date, exceptions_text, fields_json, status, signer_name, signer_title, signed_at, signed_document, created_at";
 const LINE_COLUMNS = "pay_app_id, sov_line_id, work_this_period_cents, stored_to_date_cents";
 const UNLOCKED = "NOT EXISTS (SELECT 1 FROM pay_app_lines pl JOIN pay_apps p ON p.id = pl.pay_app_id WHERE pl.sov_line_id = sov_lines.id AND p.status != 'draft')";
 
@@ -139,15 +161,21 @@ export async function loadPayAppLedger(t: Tenant, db: D1Database, payAppId: stri
 }
 
 /** Unauthenticated: the share token is the credential, so the org comes from the pay app row it names. */
-export async function loadSharedPayApp(db: D1Database, tokenHash: string): Promise<{ orgName: string; ledger: Ledger; payApp: PayAppRow } | null> {
+export async function loadSharedPayApp(db: D1Database, tokenHash: string): Promise<{ orgName: string; ledger: Ledger; payApp: PayAppRow; waivers: WaiverRow[] } | null> {
   const row = await db
     .prepare("SELECT p.id, p.org_id, p.project_id, o.name AS org_name FROM pay_apps p JOIN orgs o ON o.id = p.org_id WHERE p.share_token_hash = ? AND p.status != 'draft'")
     .bind(tokenHash)
     .first<{ id: string; org_id: string; project_id: string; org_name: string }>();
   if (!row) return null;
-  const ledger = (await loadLedgers(db, row.org_id, row.project_id))[0];
+  const [ledgers, waivers] = await Promise.all([loadLedgers(db, row.org_id, row.project_id), projectWaivers(db, row.org_id, row.project_id)]);
+  const ledger = ledgers[0];
   const payApp = ledger?.payApps.find((a) => a.id === row.id);
-  return ledger && payApp ? { orgName: row.org_name, ledger, payApp } : null;
+  return ledger && payApp ? { orgName: row.org_name, ledger, payApp, waivers } : null;
+}
+
+/** Scheduled jobs run without a session; the org id comes from the orgs table, never from a request. */
+export async function loadLedgersForOrg(db: D1Database, orgId: string): Promise<Ledger[]> {
+  return loadLedgers(db, orgId, null);
 }
 
 export async function createProject(t: Tenant, db: D1Database, id: string, p: ProjectInput, now: number) {
@@ -322,13 +350,13 @@ export async function saveDraft(
   t: Tenant,
   db: D1Database,
   payAppId: string,
-  d: { periodFrom: string; periodTo: string; retainageWorkBp: number; retainageStoredBp: number; lines: { sovLineId: string; workThisPeriodCents: number; storedToDateCents: number }[] },
+  d: { periodFrom: string; periodTo: string; retainageWorkBp: number; retainageStoredBp: number; isFinal: boolean; lines: { sovLineId: string; workThisPeriodCents: number; storedToDateCents: number }[] },
   now: number,
 ): Promise<boolean> {
   const results = await db.batch([
     db
-      .prepare("UPDATE pay_apps SET period_from = ?, period_to = ?, retainage_work_bp = ?, retainage_stored_bp = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'draft'")
-      .bind(d.periodFrom, d.periodTo, d.retainageWorkBp, d.retainageStoredBp, now, payAppId, t.orgId),
+      .prepare("UPDATE pay_apps SET period_from = ?, period_to = ?, retainage_work_bp = ?, retainage_stored_bp = ?, is_final = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'draft'")
+      .bind(d.periodFrom, d.periodTo, d.retainageWorkBp, d.retainageStoredBp, d.isFinal ? 1 : 0, now, payAppId, t.orgId),
     ...d.lines.map((l) =>
       db
         .prepare(
@@ -343,8 +371,29 @@ export async function saveDraft(
   return results[0]!.meta.changes > 0;
 }
 
-/** draft -> submitted. Freezes the line set so later schedule edits cannot change what was sent. */
-export async function submitPayApp(t: Tenant, db: D1Database, payAppId: string, shareTokenHash: string, now: number): Promise<boolean> {
+/**
+ * Creates the waiver a status change calls for, at most one per (pay app, kind): conditional on submit, unconditional on
+ * payment, final when the app is marked final. Retries hit the unique key and change nothing.
+ */
+function insertWaiver(db: D1Database, t: Tenant, payAppId: string, w: { id: string; amountCents: number }, stage: "conditional" | "unconditional", status: PayAppStatus, now: number) {
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO lien_waivers (id, org_id, project_id, pay_app_id, kind, state, amount_cents, through_date, created_at, updated_at)
+       SELECT ?1, a.org_id, a.project_id, a.id, ?2 || CASE WHEN a.is_final = 1 THEN '_final' ELSE '_progress' END, p.state, ?3, a.period_to, ?4, ?4
+       FROM pay_apps a JOIN projects p ON p.id = a.project_id WHERE a.id = ?5 AND a.org_id = ?6 AND a.status = ?7`,
+    )
+    .bind(w.id, stage, w.amountCents, now, payAppId, t.orgId, status);
+}
+
+/** draft -> submitted. Freezes the line set so later schedule edits cannot change what was sent, and creates the conditional waiver. */
+export async function submitPayApp(
+  t: Tenant,
+  db: D1Database,
+  payAppId: string,
+  shareTokenHash: string,
+  waiver: { id: string; amountCents: number },
+  now: number,
+): Promise<boolean> {
   const results = await db.batch([
     db
       .prepare(
@@ -356,30 +405,40 @@ export async function submitPayApp(t: Tenant, db: D1Database, payAppId: string, 
     db
       .prepare("UPDATE pay_apps SET status = 'submitted', submitted_at = ?, share_token_hash = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'draft'")
       .bind(now, shareTokenHash, now, payAppId, t.orgId),
+    insertWaiver(db, t, payAppId, waiver, "conditional", "submitted", now),
   ]);
   return results[1]!.meta.changes > 0;
 }
 
-/** submitted -> paid. */
-export async function markPayAppPaid(t: Tenant, db: D1Database, payAppId: string, p: { paidCents: number; paidAt: number }, now: number): Promise<boolean> {
-  const result = await db
-    .prepare("UPDATE pay_apps SET status = 'paid', paid_cents = ?, paid_at = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'submitted'")
-    .bind(p.paidCents, p.paidAt, now, payAppId, t.orgId)
-    .run();
-  return result.meta.changes > 0;
+/** submitted -> paid, creating the unconditional waiver for the amount actually received. */
+export async function markPayAppPaid(t: Tenant, db: D1Database, payAppId: string, p: { paidCents: number; paidAt: number; waiverId: string }, now: number): Promise<boolean> {
+  const [updated] = await db.batch([
+    db
+      .prepare("UPDATE pay_apps SET status = 'paid', paid_cents = ?, paid_at = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'submitted'")
+      .bind(p.paidCents, p.paidAt, now, payAppId, t.orgId),
+    insertWaiver(db, t, payAppId, { id: p.waiverId, amountCents: p.paidCents }, "unconditional", "paid", now),
+  ]);
+  return updated!.meta.changes > 0;
 }
 
-/** submitted -> draft, only for the latest app on the project; the share link dies with the submission. */
+/** submitted -> draft, only for the latest app on the project; the share link and any unsigned conditional waiver die with the submission. */
 export async function reopenPayApp(t: Tenant, db: D1Database, payAppId: string, now: number): Promise<boolean> {
-  const result = await db
-    .prepare(
-      `UPDATE pay_apps SET status = 'draft', submitted_at = NULL, share_token_hash = NULL, updated_at = ?
-       WHERE id = ? AND org_id = ? AND status = 'submitted'
-         AND NOT EXISTS (SELECT 1 FROM pay_apps later WHERE later.project_id = pay_apps.project_id AND later.number > pay_apps.number)`,
-    )
-    .bind(now, payAppId, t.orgId)
-    .run();
-  return result.meta.changes > 0;
+  const [updated] = await db.batch([
+    db
+      .prepare(
+        `UPDATE pay_apps SET status = 'draft', submitted_at = NULL, share_token_hash = NULL, updated_at = ?
+         WHERE id = ? AND org_id = ? AND status = 'submitted'
+           AND NOT EXISTS (SELECT 1 FROM pay_apps later WHERE later.project_id = pay_apps.project_id AND later.number > pay_apps.number)`,
+      )
+      .bind(now, payAppId, t.orgId),
+    db
+      .prepare(
+        `DELETE FROM lien_waivers WHERE pay_app_id = ?1 AND org_id = ?2 AND kind IN ('conditional_progress', 'conditional_final') AND status != 'signed'
+           AND EXISTS (SELECT 1 FROM pay_apps WHERE id = ?1 AND status = 'draft')`,
+      )
+      .bind(payAppId, t.orgId),
+  ]);
+  return updated!.meta.changes > 0;
 }
 
 export async function deleteDraft(t: Tenant, db: D1Database, payAppId: string): Promise<string | null> {
@@ -394,13 +453,79 @@ export async function setShareToken(t: Tenant, db: D1Database, payAppId: string,
   return result.meta.changes > 0;
 }
 
+function projectWaivers(db: D1Database, orgId: string, projectId: string): Promise<WaiverRow[]> {
+  return db
+    .prepare(`SELECT ${WAIVER_COLUMNS} FROM lien_waivers WHERE org_id = ? AND project_id = ? ORDER BY created_at, kind`)
+    .bind(orgId, projectId)
+    .all<WaiverRow>()
+    .then((r) => r.results);
+}
+
+export function listProjectWaivers(t: Tenant, db: D1Database, projectId: string): Promise<WaiverRow[]> {
+  return projectWaivers(db, t.orgId, projectId);
+}
+
+export function loadWaiver(t: Tenant, db: D1Database, waiverId: string): Promise<WaiverRow | null> {
+  return db.prepare(`SELECT ${WAIVER_COLUMNS} FROM lien_waivers WHERE id = ? AND org_id = ?`).bind(waiverId, t.orgId).first<WaiverRow>();
+}
+
+export async function saveWaiverFields(t: Tenant, db: D1Database, waiverId: string, w: { exceptionsText: string; fields: Record<string, string> }, now: number): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE lien_waivers SET exceptions_text = ?, fields_json = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status = 'draft'")
+    .bind(w.exceptionsText, JSON.stringify(w.fields), now, waiverId, t.orgId)
+    .run();
+  return result.meta.changes > 0;
+}
+
+/** draft -> sent: the waiver joins the GC share page and its fields lock. */
+export async function markWaiverSent(t: Tenant, db: D1Database, waiverId: string, now: number): Promise<boolean> {
+  const result = await db.prepare("UPDATE lien_waivers SET status = 'sent', updated_at = ? WHERE id = ? AND org_id = ? AND status = 'draft'").bind(now, waiverId, t.orgId).run();
+  return result.meta.changes > 0;
+}
+
+/** draft | sent -> signed, keeping the filled form exactly as signed. */
+export async function markWaiverSigned(
+  t: Tenant,
+  db: D1Database,
+  waiverId: string,
+  s: { signerName: string; signerTitle: string; signedAt: number; document: string },
+  now: number,
+): Promise<boolean> {
+  const result = await db
+    .prepare("UPDATE lien_waivers SET status = 'signed', signer_name = ?, signer_title = ?, signed_at = ?, signed_document = ?, updated_at = ? WHERE id = ? AND org_id = ? AND status IN ('draft', 'sent')")
+    .bind(s.signerName, s.signerTitle, s.signedAt, s.document, now, waiverId, t.orgId)
+    .run();
+  return result.meta.changes > 0;
+}
+
+/** Orgs whose trial or subscription is live; a scheduled job's only source of org ids. */
+export async function reminderOrgs(db: D1Database, now: number): Promise<{ id: string; name: string }[]> {
+  const { results } = await db.prepare("SELECT id, name FROM orgs WHERE subscription_status = 'active' OR trial_ends_at > ? ORDER BY created_at").bind(now).all<{ id: string; name: string }>();
+  return results;
+}
+
+/** Records each reminder before it is sent; returns only the ones not already recorded, so a retried run sends nothing twice. */
+export async function claimReminders(db: D1Database, orgId: string, keys: { subjectKey: string; dueOn: string }[], now: number): Promise<{ subjectKey: string; dueOn: string }[]> {
+  if (keys.length === 0) return [];
+  const results = await db.batch(
+    keys.map((k) => db.prepare("INSERT OR IGNORE INTO sent_reminders (org_id, subject_key, due_on, sent_at) VALUES (?, ?, ?, ?)").bind(orgId, k.subjectKey, k.dueOn, now)),
+  );
+  return keys.filter((_, i) => results[i]!.meta.changes > 0);
+}
+
+export async function releaseReminders(db: D1Database, orgId: string, keys: { subjectKey: string; dueOn: string }[]) {
+  if (keys.length === 0) return;
+  await db.batch(keys.map((k) => db.prepare("DELETE FROM sent_reminders WHERE org_id = ? AND subject_key = ? AND due_on = ?").bind(orgId, k.subjectKey, k.dueOn)));
+}
+
 export const EXPORT_TABLES = {
   projects: `SELECT ${PROJECT_COLUMNS} FROM projects WHERE org_id = ? ORDER BY created_at`,
   sov_lines: "SELECT id, project_id, position, item_no, description, scheduled_cents, change_order_id, created_at, updated_at FROM sov_lines WHERE org_id = ? ORDER BY project_id, position",
   change_orders: "SELECT id, project_id, number, title, amount_cents, status, approved_at, created_at, updated_at FROM change_orders WHERE org_id = ? ORDER BY project_id, number",
   pay_apps:
-    "SELECT id, project_id, number, period_from, period_to, status, retainage_work_bp, retainage_stored_bp, submitted_at, paid_at, paid_cents, created_at, updated_at FROM pay_apps WHERE org_id = ? ORDER BY project_id, number",
+    "SELECT id, project_id, number, period_from, period_to, status, retainage_work_bp, retainage_stored_bp, submitted_at, paid_at, paid_cents, is_final, created_at, updated_at FROM pay_apps WHERE org_id = ? ORDER BY project_id, number",
   pay_app_lines: `SELECT ${LINE_COLUMNS} FROM pay_app_lines WHERE org_id = ? ORDER BY pay_app_id`,
+  lien_waivers: `SELECT ${WAIVER_COLUMNS}, updated_at FROM lien_waivers WHERE org_id = ? ORDER BY project_id, created_at`,
 } as const;
 
 export type ExportTable = keyof typeof EXPORT_TABLES;

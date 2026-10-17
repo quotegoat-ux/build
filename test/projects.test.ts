@@ -1,51 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { get, orgIdFor, post, signup } from "./helpers";
-
-const PROJECT_FORM = {
-  name: "Lakeview Elementary Modernization",
-  number: "24-118",
-  gc_name: "Summit Builders",
-  gc_contact_email: "ap@summit.example",
-  owner_name: "Lakeview Unified School District",
-  location: "400 Lake St, Reno",
-  state: "nv",
-  original_contract: "$100,000",
-  retainage_work: "10",
-  retainage_stored: "5",
-  first_furnished_on: "2026-08-03",
-  last_furnished_on: "",
-};
-
-const SOV_PASTE = "Item\tDescription\tAmount\n1\tMobilization\t10,000.00\n2\tRough-in\t60,000.00\n3\tFixtures\t30,000.00\n\tTotal\t100,000.00";
-
-async function createProject(cookie: string, form: Record<string, string> = PROJECT_FORM): Promise<string> {
-  const res = await post("/app/projects", form, { cookie });
-  expect(res.status).toBe(302);
-  return res.headers.get("Location")!.match(/^\/app\/projects\/([\w-]+)\?notice=project_created$/)![1]!;
-}
-
-async function lineIds(projectId: string): Promise<string[]> {
-  const { results } = await env.DB.prepare("SELECT id FROM sov_lines WHERE project_id = ? ORDER BY position").bind(projectId).all<{ id: string }>();
-  return results.map((r) => r.id);
-}
-
-async function createPayApp(cookie: string, projectId: string, from: string, to: string): Promise<string> {
-  const res = await post(`/app/projects/${projectId}/pay-apps`, { period_from: from, period_to: to }, { cookie });
-  expect(res.status).toBe(302);
-  return res.headers.get("Location")!.replace("/app/pay-apps/", "");
-}
-
-function draftForm(ids: string[], entries: Record<number, { e?: string; f?: string; pct?: string }>, extra: Record<string, string> = {}) {
-  const form: Record<string, string> = { period_from: "2026-09-01", period_to: "2026-09-30", retainage_work: "10", retainage_stored: "5", intent: "save", ...extra };
-  ids.forEach((id, i) => {
-    form[`e_${id}`] = entries[i]?.e ?? "0";
-    form[`f_${id}`] = entries[i]?.f ?? "0";
-    form[`pct_${id}`] = entries[i]?.pct ?? "x";
-    form[`pct0_${id}`] = "x";
-  });
-  return form;
-}
+import { PROJECT_FORM, SOV_PASTE, createPayApp, createProject, draftForm, get, lineIds, orgIdFor, post, shareToken, signup } from "./helpers";
 
 const payApp = (id: string) =>
   env.DB.prepare("SELECT number, status, submitted_at IS NOT NULL AS submitted, paid_cents, paid_at, share_token_hash IS NOT NULL AS shared FROM pay_apps WHERE id = ?").bind(id).first();
@@ -56,12 +11,6 @@ const appLines = async (id: string) =>
       .bind(id)
       .all()
   ).results;
-
-async function shareToken(res: Response): Promise<string> {
-  const match = (await res.text()).match(/value="https:\/\/example\.com\/s\/([\w-]{43})"/);
-  if (!match) throw new Error("no share link on page");
-  return match[1]!;
-}
 
 async function submittedApp(cookie: string) {
   const projectId = await createProject(cookie);

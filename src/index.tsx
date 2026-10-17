@@ -6,6 +6,7 @@ import { DUMMY_PASSWORD_HASH, hashPassword, randomId, sha256Hex, verifyPassword 
 import * as db from "./db";
 import { sendEmail, linkEmail } from "./email";
 import { APP_NAME, isLocalDev, type Env } from "./env";
+import { sendReminders } from "./reminders";
 import { drawbook, shared } from "./routes";
 import { BillingPage, SettingsPage, TeamPage } from "./views/app";
 import { noticeFrom, render } from "./views/layout";
@@ -319,4 +320,9 @@ app.onError((err, c) => {
   return render(c, <MessagePage title="Something went wrong" status={500} message="Please try again in a moment." />, 500);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(sendReminders(env, controller.scheduledTime));
+  },
+} satisfies ExportedHandler<Env>;

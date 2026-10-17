@@ -67,6 +67,7 @@ export async function seedSampleProject(t: Tenant, db: D1Database, now: number):
         periodTo: app.period_to,
         retainageWorkBp: app.retainage_work_bp,
         retainageStoredBp: app.retainage_stored_bp,
+        isFinal: false,
         lines: ledger.sov.map((l) => {
           const [work, stored] = progress[l.item_no] ?? [0];
           return { sovLineId: l.id, workThisPeriodCents: work, storedToDateCents: stored ?? carried.get(l.id) ?? 0 };
@@ -75,19 +76,21 @@ export async function seedSampleProject(t: Tenant, db: D1Database, now: number):
       at,
     );
   };
+  const currentDue = async (payAppId: string) => {
+    const ledger = (await data.loadProjectLedger(t, db, projectId))!;
+    return payAppView(ledger, ledger.payApps.find((a) => a.id === payAppId)!).result.g702.currentPaymentDue;
+  };
   const period = async (n: number, progress: Progress, submittedAt: number | null) => {
     const id = randomId();
     const to = submittedAt ?? now;
     await data.createPayApp(t, db, projectId, { id, periodFrom: day(to - 30 * DAY_MS), periodTo: day(to - DAY_MS) }, to - n);
     await enter(id, progress, to);
-    if (submittedAt !== null) await data.submitPayApp(t, db, id, await sha256Hex(randomId(32)), submittedAt);
+    if (submittedAt !== null) await data.submitPayApp(t, db, id, await sha256Hex(randomId(32)), { id: randomId(), amountCents: await currentDue(id) }, submittedAt);
     return id;
   };
 
   const first = await period(1, { "1": [1_200_000], "2": [3_850_000], "3": [2_000_000, 4_500_000] }, now - 72 * DAY_MS);
-  const firstLedger = (await data.loadProjectLedger(t, db, projectId))!;
-  const due = payAppView(firstLedger, firstLedger.payApps.find((a) => a.id === first)!).result.g702.currentPaymentDue;
-  await data.markPayAppPaid(t, db, first, { paidCents: due, paidAt: Date.parse(day(now - 38 * DAY_MS)) }, now - 38 * DAY_MS);
+  await data.markPayAppPaid(t, db, first, { paidCents: await currentDue(first), paidAt: Date.parse(day(now - 38 * DAY_MS)), waiverId: randomId() }, now - 38 * DAY_MS);
 
   await data.decideChangeOrder(t, db, ev, "approved", randomId(), now - 50 * DAY_MS);
   await period(2, { "1": [400_000], "3": [6_100_000, 0], "4": [3_600_000], "5": [1_020_000], "6": [0, 2_200_000], "CO-1": [920_000] }, now - 34 * DAY_MS);

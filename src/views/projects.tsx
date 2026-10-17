@@ -1,11 +1,14 @@
 import type { Child } from "hono/jsx";
 import type { Org, User } from "../db";
+import type { DeadlineReport, UpcomingDeadline } from "../deadlines";
 import { daysBetween, type Dashboard, type PayAppView, type ProjectSummary } from "../ledger";
 import { centsToDecimal, formatBp, formatMoney } from "../money";
 import type { G702, G703Row, Issue } from "../payapp";
-import type { Ledger, PayAppStatus, Project } from "../projectsDb";
+import type { Ledger, PayAppStatus, Project, WaiverRow } from "../projectsDb";
+import type { WaiverView } from "../waivers";
 import { PAY_APP_SCRIPT } from "./payappScript";
 import { AppShell, Document, ErrorText, Field, Mark } from "./layout";
+import { DeadlinesSection, SharedWaivers, UpcomingDeadlinesCard, WaiverList } from "./liens";
 
 type ShellProps = { org: Org; user: User; notice?: string };
 
@@ -73,7 +76,7 @@ function EmptyState() {
   );
 }
 
-export function DashboardPage({ org, user, notice, summaries, dash }: ShellProps & { summaries: ProjectSummary[]; dash: Dashboard }) {
+export function DashboardPage({ org, user, notice, summaries, dash, upcoming }: ShellProps & { summaries: ProjectSummary[]; dash: Dashboard; upcoming: UpcomingDeadline[] }) {
   return (
     <AppShell title="Dashboard" active="dashboard" org={org} user={user} notice={notice}>
       <h1>Cash at a glance</h1>
@@ -109,6 +112,7 @@ export function DashboardPage({ org, user, notice, summaries, dash }: ShellProps
               ))}
             </ul>
           )}
+          <UpcomingDeadlinesCard upcoming={upcoming} />
           <p>
             <a href="/app/projects" class="btn btn-ghost">
               All projects
@@ -285,7 +289,9 @@ export function ProjectPage({
   ledger,
   paste,
   today,
-}: ShellProps & { error?: string; summary: ProjectSummary; ledger: Ledger; paste?: string; today: string }) {
+  waivers,
+  deadlines,
+}: ShellProps & { error?: string; summary: ProjectSummary; ledger: Ledger; paste?: string; today: string; waivers: WaiverRow[]; deadlines: DeadlineReport }) {
   const p = ledger.project;
   const draft = ledger.payApps.find((a) => a.status === "draft");
   const last = ledger.payApps.at(-1);
@@ -357,6 +363,17 @@ export function ProjectPage({
           </details>
         )}
       </section>
+
+      <section>
+        <h2>Lien waivers</h2>
+        <WaiverList
+          waivers={waivers}
+          appNumbers={new Map(ledger.payApps.map((a) => [a.id, a.number]))}
+          empty="Submitting a pay application creates its conditional waiver. Recording payment creates the unconditional one."
+        />
+      </section>
+
+      <DeadlinesSection report={deadlines} today={today} />
 
       <section>
         <h2>Schedule of values</h2>
@@ -623,6 +640,15 @@ function G703Table({ view, editable }: { view: PayAppView; editable: boolean }) 
   );
 }
 
+function G703({ view, editable }: { view: PayAppView; editable: boolean }) {
+  return (
+    <>
+      <G703Table view={view} editable={editable} />
+      <p class="muted small g703-hint">Swipe the table sideways to see every column.</p>
+    </>
+  );
+}
+
 function Issues({ issues }: { issues: Issue[] }) {
   if (issues.length === 0) return <p class="notice">Checks passed. The numbers tie and nothing is overbilled.</p>;
   return (
@@ -672,7 +698,16 @@ function ShareBox({ view, shareUrl }: { view: PayAppView; shareUrl?: string }) {
   );
 }
 
-export function PayAppPage({ org, user, notice, error, view, shareUrl, today }: ShellProps & { error?: string; view: PayAppView; shareUrl?: string; today: string }) {
+export function PayAppPage({
+  org,
+  user,
+  notice,
+  error,
+  view,
+  shareUrl,
+  today,
+  waivers,
+}: ShellProps & { error?: string; view: PayAppView; shareUrl?: string; today: string; waivers: WaiverRow[] }) {
   const { project, payApp, result } = view;
   const draft = payApp.status === "draft";
   return (
@@ -685,6 +720,7 @@ export function PayAppPage({ org, user, notice, error, view, shareUrl, today }: 
           <h1>Pay application #{payApp.number}</h1>
           <p class="muted">
             {payApp.period_from} to {payApp.period_to} · {project.gc_name || "No GC"}
+            {payApp.is_final === 1 && " · Final application"}
           </p>
         </div>
         <StatusPill status={payApp.status} />
@@ -716,10 +752,16 @@ export function PayAppPage({ org, user, notice, error, view, shareUrl, today }: 
               <Field label="Retainage on work (%)" name="retainage_work" value={formatBp(payApp.retainage_work_bp).replace("%", "")} />
               <Field label="Retainage on stored (%)" name="retainage_stored" value={formatBp(payApp.retainage_stored_bp).replace("%", "")} />
             </div>
+            <label class="check">
+              <input type="checkbox" name="is_final" value="1" checked={payApp.is_final === 1} />
+              <span>
+                Final application. Submitting creates a conditional <em>final</em> lien waiver instead of a progress waiver.
+              </span>
+            </label>
           </div>
           <h2>Continuation sheet</h2>
           <p class="muted small">Enter work completed this period as an amount (E) or as percent complete to date. Stored materials (F) is the balance on hand now.</p>
-          <G703Table view={view} editable />
+          <G703 view={view} editable />
           <h2>Summary</h2>
           <G702Summary g={result.g702} />
           <Issues issues={view.issues} />
@@ -758,8 +800,12 @@ export function PayAppPage({ org, user, notice, error, view, shareUrl, today }: 
             </section>
           )}
           <ShareBox view={view} shareUrl={shareUrl} />
+          <section>
+            <h2>Lien waivers</h2>
+            <WaiverList waivers={waivers} appNumbers={new Map()} empty="No waivers for this application." />
+          </section>
           <h2>Continuation sheet</h2>
-          <G703Table view={view} editable={false} />
+          <G703 view={view} editable={false} />
         </>
       )}
       {draft && (
@@ -774,7 +820,7 @@ export function PayAppPage({ org, user, notice, error, view, shareUrl, today }: 
   );
 }
 
-export function SharedPayAppPage({ orgName, view, token }: { orgName: string; view: PayAppView; token: string }) {
+export function SharedPayAppPage({ orgName, view, token, waivers }: { orgName: string; view: PayAppView; token: string; waivers: WaiverView[] }) {
   const { project, payApp, result } = view;
   return (
     <Document title={`Pay application #${payApp.number} · ${project.name}`} noindex>
@@ -808,7 +854,8 @@ export function SharedPayAppPage({ orgName, view, token }: { orgName: string; vi
         <h2>Summary</h2>
         <G702Summary g={result.g702} />
         <h2>Continuation sheet</h2>
-        <G703Table view={view} editable={false} />
+        <G703 view={view} editable={false} />
+        <SharedWaivers views={waivers} token={token} />
         <p class="muted small">Read-only copy shared by {orgName}. Sent with Drawbook.</p>
       </main>
     </Document>

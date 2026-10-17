@@ -218,6 +218,14 @@ export async function syncSubscription(
   return result.meta.changes > 0;
 }
 
+export async function orgAdminEmails(db: D1Database, orgId: string): Promise<string[]> {
+  const { results } = await db
+    .prepare("SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.org_id = ? AND m.role IN ('owner', 'admin') ORDER BY m.created_at")
+    .bind(orgId)
+    .all<{ email: string }>();
+  return results.map((r) => r.email);
+}
+
 // Tenant-scoped.
 
 export async function listMembers(t: Tenant, db: D1Database): Promise<Member[]> {

@@ -2,6 +2,7 @@ import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage } from "pdf
 import type { PayAppView } from "./ledger";
 import { formatBp, formatMoney } from "./money";
 import type { G703Row, G703Totals } from "./payapp";
+import { UNVERIFIED_BADGE, WAIVER_DISCLAIMER, type WaiverView } from "./waivers";
 
 const INK = rgb(0.11, 0.1, 0.09);
 const MUTED = rgb(0.4, 0.38, 0.36);
@@ -217,5 +218,80 @@ export async function payAppPdf(orgName: string, v: PayAppView): Promise<ArrayBu
   const fonts = { regular: await doc.embedFont(StandardFonts.Helvetica), bold: await doc.embedFont(StandardFonts.HelveticaBold) };
   summaryPage(doc, fonts, orgName, v);
   continuationPages(doc, fonts, orgName, v);
+  return (await doc.save()).slice().buffer;
+}
+
+function wrap(s: string, font: PDFFont, size: number, width: number): string[] {
+  const lines: string[] = [];
+  let line = "";
+  for (const word of safe(s).split(/ +/)) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && font.widthOfTextAtSize(next, size) > width) {
+      lines.push(line);
+      line = word;
+    } else line = next;
+  }
+  return [...lines, line];
+}
+
+export async function waiverPdf(orgName: string, v: WaiverView): Promise<ArrayBuffer> {
+  const doc = await PDFDocument.create();
+  const d = v.document;
+  doc.setTitle(safe(`${d.title} - ${v.project.name}`));
+  doc.setAuthor(safe(orgName));
+  doc.setCreator("Drawbook");
+  const f = { regular: await doc.embedFont(StandardFonts.Helvetica), bold: await doc.embedFont(StandardFonts.HelveticaBold) };
+  const margin = 54;
+  const width = PORTRAIT[0] - margin * 2;
+  const bottom = margin + 40;
+  let page = doc.addPage(PORTRAIT);
+  let y = PORTRAIT[1] - margin;
+  const ensure = (needed: number) => {
+    if (y - needed >= bottom) return;
+    page = doc.addPage(PORTRAIT);
+    y = PORTRAIT[1] - margin;
+  };
+  const paragraph = (s: string, o: { font: PDFFont; size: number; color?: ReturnType<typeof rgb>; leading?: number }) => {
+    for (const line of wrap(s, o.font, o.size, width)) {
+      ensure(o.size + 3);
+      text(page, line, margin, y - o.size, { font: o.font, size: o.size, color: o.color });
+      y -= o.leading ?? o.size + 3.5;
+    }
+  };
+
+  text(page, orgName, margin, y - 8, { font: f.regular, size: 8, color: MUTED });
+  text(page, [v.project.name, v.payAppNumber !== null && `Pay application #${v.payAppNumber}`].filter(Boolean).join(" - "), margin + width, y - 8, {
+    font: f.regular,
+    size: 8,
+    color: MUTED,
+    align: "right",
+  });
+  y -= 22;
+  if (!d.verified) {
+    page.drawRectangle({ x: margin, y: y - 18, width, height: 18, color: SHADE });
+    text(page, UNVERIFIED_BADGE.toUpperCase(), margin + 6, y - 12.5, { font: f.bold, size: 8.5 });
+    y -= 26;
+  }
+  if (d.source === "generic") paragraph(d.reason, { font: f.regular, size: 8.5, color: MUTED });
+  else paragraph(`Statutory form: ${d.citation}`, { font: f.regular, size: 8, color: MUTED });
+  if (d.notarize) paragraph("This state requires the waiver to be notarized.", { font: f.bold, size: 8.5 });
+  if (d.witness) paragraph("This state requires a witness to the signature.", { font: f.bold, size: 8.5 });
+  y -= 6;
+  rule(page, margin, y, margin + width, 1);
+  y -= 10;
+
+  // One type size for the whole form: several states require the notice to be at least as large as any other type, Georgia at least 12 point.
+  const [heading, ...rest] = d.body.split("\n");
+  paragraph(heading ?? d.title, { font: f.bold, size: 12, leading: 16 });
+  for (const line of rest) {
+    if (line.trim() === "") y -= 6;
+    else paragraph(line, { font: /^NOTICE/.test(line) || (/^[A-Z0-9 .,'():-]{4,}$/.test(line) && line.length < 80) ? f.bold : f.regular, size: 12, leading: 15 });
+  }
+
+  const pages = doc.getPages();
+  pages.forEach((p, i) => {
+    wrap(WAIVER_DISCLAIMER, f.regular, 7, width - 60).forEach((line, j) => text(p, line, margin, margin - 2 - j * 9, { font: f.regular, size: 7, color: MUTED }));
+    text(p, `Page ${i + 1} of ${pages.length}`, margin + width, margin - 2, { font: f.regular, size: 7, color: MUTED, align: "right" });
+  });
   return (await doc.save()).slice().buffer;
 }
