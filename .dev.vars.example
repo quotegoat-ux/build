@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local development. All are optional: without them the
+# app logs emails instead of sending and shows billing as not configured.
+RESEND_API_KEY=
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+STRIPE_PRICE_ID=
